@@ -1,0 +1,209 @@
+import pickle
+from threading import Thread
+from typing import Optional, List, Callable, Dict, Any, Tuple
+
+import cv2
+import numpy as np
+
+import os
+
+from tf_pose.estimator import TfPoseEstimator
+from tf_pose.networks import get_graph_path
+
+from Batch import Batch
+from Logger import Logger
+from SkillShape import SkillShape
+
+Reporter = Callable[[str, float], None]
+
+
+class TrampScorer:
+    def __init__(self, env_root: str):
+        self.env_root = os.path.abspath(env_root)
+        self.source_name = None
+        for root, dirs, files in os.walk(env_root):
+            if root == env_root:
+                for filename in files:
+                    if "source" in filename:
+                        self.source_name = filename
+                        break
+                break
+
+        if self.source_name is None:
+            raise FileNotFoundError("No video named 'source' in folder %s" % env_root)
+
+        self.env_root = env_root
+        self.video_reader = cv2.VideoCapture(env_root + "/" + self.source_name)
+        self.frame_count = int(self.video_reader.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.frame_width = int(self.video_reader.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.video_reader.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.frame_rate = int(self.video_reader.get(cv2.CAP_PROP_FPS))
+
+        self.pose_estimator: Optional[TfPoseEstimator] = None
+
+        self.left_cutoff: Optional[int] = None
+        self.right_cutoff: Optional[int] = None
+        self.bed_y: Optional[int] = None
+        self.backplate_frame_count: Optional[int] = None
+        self.backplate_frame_gap: Optional[int] = None
+        self.backplate_cooldown: Optional[int] = None
+        self.focus_width: Optional[int] = None
+        self.focus_height: Optional[int] = None
+        self.position_smoothing_factor: Optional[float] = None
+
+        self.logger = Logger()
+        self.batches: Optional[List[Batch]] = None
+        self.batch_count: Optional[int] = None
+
+        self.skill_angles: Optional[np.ndarray] = None
+        self.skill_shapes: Optional[List[SkillShape]] = None
+        self.skill_video_names: Optional[List[str]] = None
+
+    def set_constants(self, left_cutoff: int, right_cutoff: int, bed_y: int, backplate_frame_count: int,
+                      backplate_frame_gap: int, backplate_cooldown: int, focus_width: int, focus_height: int,
+                      position_smoothing_factor: float):
+        self.left_cutoff = left_cutoff
+        self.right_cutoff = right_cutoff
+        self.bed_y = bed_y
+        self.backplate_frame_count = backplate_frame_count
+        self.backplate_frame_gap = backplate_frame_gap
+        self.backplate_cooldown = backplate_cooldown
+        self.focus_width = focus_width
+        self.focus_height = focus_height
+        self.position_smoothing_factor = position_smoothing_factor
+
+    def allocate_memory(self):
+        batch_size = self.backplate_frame_count * self.backplate_frame_gap + self.backplate_cooldown
+        batch_index = 0
+
+        self.batches = []
+
+        # Allocate memory
+        for current_frame in range(0, self.frame_count, batch_size):
+            local_batch_size = min(batch_size, self.frame_count - current_frame)
+
+            self.batches.append(
+                Batch(
+                    batch_index,
+                    local_batch_size,
+                    self.right_cutoff - self.left_cutoff,
+                    self.frame_height,
+                    self.bed_y,
+                    self.focus_width,
+                    self.frame_height,
+                    self.logger.tag("Batch %d" % batch_index))
+            )
+
+            batch_index += 1
+
+        # Set adjacent batches
+        self.batches[0].set_adjacent_batches(None, self.batches[1])
+        for index in range(1, batch_index - 1):
+            self.batches[index].set_adjacent_batches(self.batches[index - 1], self.batches[index + 1])
+
+        self.batches[batch_index - 1].set_adjacent_batches(self.batches[batch_index - 2], None)
+        self.batch_count = batch_index
+
+        self.pose_estimator = TfPoseEstimator(get_graph_path("mobilenet_thin"),
+                                              target_size=(self.focus_width, self.focus_height))
+
+
+    def start(self):
+        loader_threads: List[Thread] = []
+
+        def loader(batch: Batch):
+            batch.find_backplate(self.backplate_frame_gap, self.backplate_cooldown)
+            batch.find_performer()
+
+        for batch in self.batches:
+            batch.load_frames(self.video_reader, self.left_cutoff, self.right_cutoff)
+
+            thread = Thread(target=loader, args=[batch], name="Batch %d loader" % batch.index)
+            thread.start()
+            loader_threads.append(thread)
+
+        for index in range(self.batch_count):
+            loader_threads[index].join()
+
+        for batch in self.batches:
+            batch.smooth_positions(self.position_smoothing_factor)
+
+        for batch in self.batches:
+            batch.differentiate_ys()
+
+        carry_index = 0
+        carry_ascending = False
+        for batch in self.batches:
+            carry_index, carry_ascending = batch.index_skills(carry_index, carry_ascending)
+
+        write_skills_thread = Thread(target=self.write_skills)
+        write_skills_thread.start()
+
+        self.skill_angles = np.array([0], np.float32)
+        for batch in self.batches:
+            self.skill_angles = batch.find_skill_angles(self.skill_angles)
+            batch.focus_images()
+            # for frame in batch.frames:
+            #     cv2.imshow("x", frame.focus_image)
+            #     cv2.waitKey(0)
+
+
+        for batch in self.batches:
+            batch.find_poses(self.pose_estimator)
+            batch.find_shapes()
+
+        max_hip_angle = [0]
+        max_knee_angle = [0]
+
+        for frame_index in range(1, self.frame_count):
+            current_frame = self.batches[0].get_relative_frame(frame_index)
+            if current_frame.skill_index > self.batches[0].get_relative_frame(frame_index - 1).skill_index:
+                max_hip_angle.append(0)
+                max_knee_angle.append(0)
+
+            if (current_frame.hip_angle or 0) > max_hip_angle[-1]:
+                max_hip_angle[-1] = current_frame.hip_angle
+
+            if (current_frame.knee_angle or 0) > max_knee_angle[-1]:
+                max_knee_angle[-1] = current_frame.knee_angle
+
+        self.skill_shapes = []
+
+        for skill_index in range(len(max_hip_angle)):
+            if max_hip_angle[skill_index] < 20:
+                self.skill_shapes.append(SkillShape.STRAIGHT)
+            else:
+                if max_knee_angle[skill_index] < 20:
+                    self.skill_shapes.append(SkillShape.PIKE)
+                else:
+                    self.skill_shapes.append(SkillShape.TUCK)
+
+        write_skills_thread.join()
+
+    def get_skill_writer(self, index: int) -> Tuple[cv2.VideoWriter, str]:
+        path = "skill_%d.webm" % index
+        return cv2.VideoWriter(self.env_root + "/" + path, cv2.VideoWriter_fourcc('V','P','8','0'), self.frame_rate,
+                               (self.right_cutoff - self.left_cutoff, self.frame_height)), path
+
+    def write_skills(self):
+        timer = self.logger.start_timer("Write skills")
+
+        self.skill_video_names = []
+
+        current_writer, video_path = self.get_skill_writer(0)
+
+        current_frame = self.batches[0].frames[0]
+        next_frame = current_frame.next_frame
+        while next_frame is not None:
+            current_writer.write(current_frame.image)
+            if current_frame.skill_index < next_frame.skill_index:
+                current_writer.release()
+                self.skill_video_names.append(video_path)
+                current_writer, video_path = self.get_skill_writer(next_frame.skill_index)
+            current_frame = next_frame
+            next_frame = current_frame.next_frame
+
+        current_writer.write(current_frame.image)
+        current_writer.release()
+        self.skill_video_names.append(video_path)
+        timer.end()
